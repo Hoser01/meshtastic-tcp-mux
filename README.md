@@ -2,7 +2,7 @@
 
 A small standalone TCP multiplexer for Meshtastic.
 
-Contact: Hoser/Chris de W0WC at info@larc.com for comments, suggestions, or
+Contact: Hoser/Chris de W0WC at info@lzarc.com for comments, suggestions, or
 issues.
 
 It keeps one TCP connection open to a real Meshtastic node, then allows multiple
