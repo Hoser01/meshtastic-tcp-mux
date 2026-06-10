@@ -105,20 +105,17 @@ Clone the repository on the Linux machine:
 
 ```bash
 cd /tmp
-git clone https://github.com/YOURUSER/meshtastic-tcp-mux.git
+git clone https://github.com/Hoser01/meshtastic-tcp-mux.git
 cd meshtastic-tcp-mux
 chmod +x install.sh uninstall.sh
 sudo ./install.sh
 ```
 
-Replace `YOURUSER` with the GitHub account or organization that owns the
-repository.
-
 To install a specific released version from Git:
 
 ```bash
 cd /tmp
-git clone https://github.com/YOURUSER/meshtastic-tcp-mux.git
+git clone https://github.com/Hoser01/meshtastic-tcp-mux.git
 cd meshtastic-tcp-mux
 git checkout v0.2.0
 chmod +x install.sh uninstall.sh
