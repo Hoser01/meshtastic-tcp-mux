@@ -5,7 +5,7 @@ meshtastic-tcp-mux
 Small TCP fanout/mux for Meshtastic's stream protocol.
 One upstream node connection, many local downstream TCP clients.
 
-Contact: Hoser/Chris de W0WC at info@larc.com for comments, suggestions, or issues.
+Contact: Hoser/Chris de W0WC at info@lzarc.com for comments, suggestions, or issues.
 """
 
 from __future__ import annotations
