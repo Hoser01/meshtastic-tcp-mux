@@ -2,6 +2,9 @@
 
 A small standalone TCP multiplexer for Meshtastic.
 
+Contact: Hoser/Chris de W0WC at info@larc.com for comments, suggestions, or
+issues.
+
 It keeps one TCP connection open to a real Meshtastic node, then allows multiple
 local or remote clients/scripts to connect to a separate virtual TCP port.
 
@@ -55,7 +58,7 @@ Upload the versioned release zip file to `/tmp` on the Linux machine.
 
 ```bash
 cd /tmp
-unzip meshtastic-tcp-mux-0.2.0.zip
+unzip meshtastic-tcp-mux-0.2.1.zip
 cd meshtastic-tcp-mux
 chmod +x install.sh uninstall.sh
 sudo ./install.sh
@@ -118,7 +121,7 @@ To install a specific released version from Git:
 cd /tmp
 git clone https://github.com/Hoser01/meshtastic-tcp-mux.git
 cd meshtastic-tcp-mux
-git checkout v0.2.0
+git checkout v0.2.1
 chmod +x install.sh uninstall.sh
 sudo ./install.sh
 ```
@@ -282,5 +285,3 @@ sudo ss -ltnp | grep 4405
 
 Losing the upstream node connection should show the upstream state as
 `reconnecting`, but it should not kill the listener on port `4405`.
-
-
