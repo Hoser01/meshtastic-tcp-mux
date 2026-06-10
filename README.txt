@@ -2,7 +2,7 @@
 
 A small standalone TCP multiplexer for Meshtastic.
 
-Contact: Hoser/Chris de W0WC at info@zlarc.com for comments, suggestions, or
+Contact: Hoser/Chris de W0WC at info@lzarc.com for comments, suggestions, or
 issues.
 
 It keeps one TCP connection open to a real Meshtastic node, then allows multiple
@@ -58,7 +58,7 @@ Upload the versioned release zip file to `/tmp` on the Linux machine.
 
 ```bash
 cd /tmp
-unzip meshtastic-tcp-mux-0.2.1.zip
+unzip meshtastic-tcp-mux-0.2.2.zip
 cd meshtastic-tcp-mux
 chmod +x install.sh uninstall.sh
 sudo ./install.sh
@@ -121,7 +121,7 @@ To install a specific released version from Git:
 cd /tmp
 git clone https://github.com/Hoser01/meshtastic-tcp-mux.git
 cd meshtastic-tcp-mux
-git checkout v0.2.1
+git checkout v0.2.2
 chmod +x install.sh uninstall.sh
 sudo ./install.sh
 ```

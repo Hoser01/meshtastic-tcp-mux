@@ -1,1 +1,1 @@
-meshtastic-tcp-mux 0.2.1
+meshtastic-tcp-mux 0.2.2
