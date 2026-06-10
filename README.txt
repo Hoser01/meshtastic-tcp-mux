@@ -284,10 +284,3 @@ sudo ss -ltnp | grep 4405
 
 Losing the upstream node connection should show the upstream state as
 `reconnecting`, but it should not kill the listener on port `4405`.
-
-## GitHub Release Notes
-
-For source control, keep generated artifacts such as `__pycache__/` out of the
-repository. The versioned `meshtastic-tcp-mux-0.2.0.zip` bundle is a release
-artifact and should be regenerated after README or script changes so it does not
-drift from the source files.
