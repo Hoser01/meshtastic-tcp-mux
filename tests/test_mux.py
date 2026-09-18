@@ -60,6 +60,38 @@ class PolicyTests(unittest.TestCase):
 
 
 class BackpressureTests(unittest.TestCase):
+    def test_queue_and_writer_serialize_bytearray_access(self):
+        service = mux.MeshtasticTcpMux()
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        left.setblocking(False)
+        right.setblocking(False)
+        client = mux.Client(left, ("local", 1), 1)
+        service.clients[1] = client
+        selector = selectors.DefaultSelector()
+        self.addCleanup(selector.close)
+        selector.register(left, selectors.EVENT_READ, client)
+        failures = []
+
+        def producer():
+            try:
+                for _ in range(500):
+                    service._queue_client_data(client, b"x", selector)
+            except Exception as exc:
+                failures.append(exc)
+
+        thread = threading.Thread(target=producer)
+        thread.start()
+        while thread.is_alive():
+            service._write_client(client, selector)
+            try:
+                right.recv(4096)
+            except BlockingIOError:
+                pass
+        thread.join()
+        self.assertEqual(failures, [])
+
     def test_slow_client_is_dropped_at_bounded_queue(self):
         service = mux.MeshtasticTcpMux()
         left, right = socket.socketpair()

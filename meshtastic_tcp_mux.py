@@ -122,6 +122,7 @@ class Client:
     bytes_in: int = 0
     bytes_out: int = 0
     txbuf: bytearray = field(default_factory=bytearray)
+    tx_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def name(self) -> str:
@@ -839,11 +840,16 @@ class MeshtasticTcpMux:
         data: bytes,
         selector: Optional[selectors.BaseSelector],
     ) -> bool:
-        if len(client.txbuf) + len(data) > CLIENT_SEND_QUEUE_MAX_BYTES:
+        queue_full = False
+        with client.tx_lock:
+            if len(client.txbuf) + len(data) > CLIENT_SEND_QUEUE_MAX_BYTES:
+                queue_full = True
+            else:
+                client.txbuf.extend(data)
+        if queue_full:
             self.stats.inc("frames_dropped")
             self._disconnect_client(client, selector, "slow client send queue full")
             return False
-        client.txbuf.extend(data)
         active_selector = selector or self._listener_selector
         if active_selector is not None:
             with self.selector_lock:
@@ -855,22 +861,34 @@ class MeshtasticTcpMux:
         return True
 
     def _write_client(self, client: Client, selector: selectors.BaseSelector) -> None:
-        if not client.txbuf:
+        with client.tx_lock:
+            has_data = bool(client.txbuf)
+        if not has_data:
             try:
-                selector.modify(client.sock, selectors.EVENT_READ, client)
+                with self.selector_lock:
+                    with client.tx_lock:
+                        events = selectors.EVENT_READ
+                        if client.txbuf:
+                            events |= selectors.EVENT_WRITE
+                    selector.modify(client.sock, events, client)
             except Exception:
                 self._disconnect_client(client, selector, "write interest update failed")
             return
         try:
-            sent = client.sock.send(client.txbuf)
-            if sent <= 0:
-                raise ConnectionError("socket send returned 0")
-            del client.txbuf[:sent]
+            with client.tx_lock:
+                sent = client.sock.send(client.txbuf)
+                if sent <= 0:
+                    raise ConnectionError("socket send returned 0")
+                del client.txbuf[:sent]
             client.bytes_out += sent
-            if not client.txbuf:
+            with self.selector_lock:
+                with client.tx_lock:
+                    drained = not client.txbuf
+                if drained:
+                    selector.modify(client.sock, selectors.EVENT_READ, client)
+            if drained:
                 client.frames_out += 1
                 self.stats.inc("frames_to_clients")
-                selector.modify(client.sock, selectors.EVENT_READ, client)
         except BlockingIOError:
             return
         except Exception as exc:
