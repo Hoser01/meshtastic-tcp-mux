@@ -15,6 +15,7 @@ import errno
 import logging
 import os
 import queue
+import select
 import selectors
 import signal
 import socket
@@ -49,15 +50,20 @@ SOCKET_KEEPALIVE = True
 OUTBOUND_DELAY_SECONDS = 0.35          # spacing between client-originated frames
 OUTBOUND_QUEUE_SIZE = 500
 DROP_CLIENT_IF_QUEUE_FULL = False
+OUTBOUND_MAX_AGE_SECONDS = 30
+UPSTREAM_SEND_TIMEOUT_SECONDS = 5
 
-CACHE_REPLAY_TO_NEW_CLIENTS = True
+CACHE_REPLAY_TO_NEW_CLIENTS = False
 CACHE_MAX_FRAMES = 512
 CACHE_MAX_AGE_SECONDS = 900            # 15 minutes
+CACHE_REPLAY_MAX_BYTES = 131072
+CLIENT_SEND_QUEUE_MAX_BYTES = 262144
 
 FILTER_CLIENT_ADMIN = True             # requires meshtastic protobuf package
 FILTER_CLIENT_CONFIG = False           # if True, blocks client config writes too
 FILTER_CLIENT_MODULE_CONFIG = False    # if True, blocks module config writes too
-ALLOW_RAW_WHEN_PROTOBUF_MISSING = True  # if False, block filtered packet types when protobuf parsing unavailable
+ALLOW_RAW_WHEN_PROTOBUF_MISSING = False # fail closed while any packet filter is enabled
+BLOCK_CLIENT_DISCONNECT = True          # downstream sessions must not close the shared upstream
 
 LOG_LEVEL = "INFO"
 LOG_HEX_FRAMES = False
@@ -72,7 +78,7 @@ HEADER_LEN = 4
 MAX_FRAME_SIZE = 512
 
 SERVICE_NAME = "meshtastic-tcp-mux"
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 
 HEALTH_CHECK_INTERVAL_SECONDS = 15
 LISTENER_RESTART_DELAY_SECONDS = 2
@@ -85,9 +91,11 @@ SYSTEMD_WATCHDOG_ENABLED = True
 # =============================================================================
 
 try:
-    from meshtastic.protobuf import mesh_pb2  # type: ignore
+    from meshtastic.protobuf import admin_pb2, mesh_pb2, portnums_pb2  # type: ignore
 except Exception:  # pragma: no cover - intentionally broad for optional dependency
+    admin_pb2 = None
     mesh_pb2 = None
+    portnums_pb2 = None
 
 
 # =============================================================================
@@ -113,6 +121,7 @@ class Client:
     frames_out: int = 0
     bytes_in: int = 0
     bytes_out: int = 0
+    txbuf: bytearray = field(default_factory=bytearray)
 
     @property
     def name(self) -> str:
@@ -248,7 +257,7 @@ def summarize_payload(direction: str, payload: bytes) -> str:
         else:
             msg = mesh_pb2.FromRadio()
         msg.ParseFromString(payload)
-        fields = [name for name, _value in msg.ListFields()]
+        fields = [field.name for field, _value in msg.ListFields()]
         if not fields:
             return f"{direction} len={len(payload)} empty"
         return f"{direction} len={len(payload)} fields={','.join(fields)}"
@@ -257,6 +266,24 @@ def summarize_payload(direction: str, payload: bytes) -> str:
 
 
 def client_frame_allowed(frame: Frame) -> Tuple[bool, str]:
+    """Apply policy to a complete ToRadio frame.
+
+    ``disconnect`` belongs to a TCP/API session, not to an RF packet.  Passing a
+    downstream disconnect through a mux tears down the single shared radio
+    connection, so it is always handled locally when configured.
+    """
+    if mesh_pb2 is not None:
+        try:
+            msg = mesh_pb2.ToRadio()
+            msg.ParseFromString(frame.payload)
+            if BLOCK_CLIENT_DISCONNECT and msg.HasField("disconnect"):
+                return False, "downstream disconnect handled locally"
+        except Exception as exc:
+            if not ALLOW_RAW_WHEN_PROTOBUF_MISSING:
+                return False, f"unparsed protobuf blocked: {exc.__class__.__name__}"
+    elif BLOCK_CLIENT_DISCONNECT and _protobuf_has_field(frame.payload, 4):
+        return False, "downstream disconnect handled locally"
+
     if not (FILTER_CLIENT_ADMIN or FILTER_CLIENT_CONFIG or FILTER_CLIENT_MODULE_CONFIG):
         return True, "allowed"
 
@@ -268,23 +295,73 @@ def client_frame_allowed(frame: Frame) -> Tuple[bool, str]:
     try:
         msg = mesh_pb2.ToRadio()
         msg.ParseFromString(frame.payload)
-        field_names = {name for name, _value in msg.ListFields()}
     except Exception as exc:
         if ALLOW_RAW_WHEN_PROTOBUF_MISSING:
             return True, f"unparsed protobuf allowed: {exc.__class__.__name__}"
         return False, f"unparsed protobuf blocked: {exc.__class__.__name__}"
 
     blocked: List[str] = []
-    if FILTER_CLIENT_ADMIN and "admin" in field_names:
-        blocked.append("admin")
-    if FILTER_CLIENT_CONFIG and "set_config" in field_names:
-        blocked.append("set_config")
-    if FILTER_CLIENT_MODULE_CONFIG and "set_module_config" in field_names:
-        blocked.append("set_module_config")
+    if msg.HasField("packet") and msg.packet.HasField("decoded"):
+        decoded = msg.packet.decoded
+        if portnums_pb2 is not None and decoded.portnum == portnums_pb2.ADMIN_APP:
+            admin_variant = "admin"
+            if admin_pb2 is not None:
+                try:
+                    admin = admin_pb2.AdminMessage()
+                    admin.ParseFromString(decoded.payload)
+                    admin_variant = admin.WhichOneof("payload_variant") or "admin"
+                except Exception:
+                    admin_variant = "unparsed_admin"
+            if FILTER_CLIENT_ADMIN:
+                blocked.append(admin_variant)
+            elif FILTER_CLIENT_CONFIG and admin_variant == "set_config":
+                blocked.append(admin_variant)
+            elif FILTER_CLIENT_MODULE_CONFIG and admin_variant == "set_module_config":
+                blocked.append(admin_variant)
 
     if blocked:
         return False, "blocked fields: " + ",".join(blocked)
     return True, "allowed"
+
+
+def _protobuf_has_field(payload: bytes, wanted: int) -> bool:
+    """Small fail-safe protobuf wire scanner used when Meshtastic is absent."""
+    pos = 0
+    try:
+        while pos < len(payload):
+            key, pos = _read_varint(payload, pos)
+            field, wire = key >> 3, key & 7
+            if field == wanted:
+                return True
+            if wire == 0:
+                _value, pos = _read_varint(payload, pos)
+            elif wire == 1:
+                pos += 8
+            elif wire == 2:
+                size, pos = _read_varint(payload, pos)
+                pos += size
+            elif wire == 5:
+                pos += 4
+            else:
+                return False
+            if pos > len(payload):
+                return False
+    except (IndexError, ValueError):
+        return False
+    return False
+
+
+def _read_varint(payload: bytes, pos: int) -> Tuple[int, int]:
+    value = 0
+    for shift in range(0, 70, 7):
+        if pos >= len(payload):
+            raise IndexError
+        byte = payload[pos]
+        pos += 1
+        value |= (byte & 0x7f) << shift
+        if not byte & 0x80:
+            return value, pos
+    raise ValueError("varint too long")
 
 
 # =============================================================================
@@ -317,6 +394,25 @@ def send_all(sock: socket.socket, data: bytes) -> None:
         view = view[sent:]
 
 
+def send_all_with_deadline(sock: socket.socket, data: bytes, timeout: float) -> None:
+    """Send without changing socket-wide timeout state used by the reader."""
+    view = memoryview(data)
+    deadline = time.monotonic() + timeout
+    while view:
+        try:
+            sent = sock.send(view, socket.MSG_DONTWAIT)
+            if sent == 0:
+                raise ConnectionError("socket send returned 0")
+            view = view[sent:]
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("socket send deadline exceeded")
+            _readable, writable, _errors = select.select([], [sock], [sock], remaining)
+            if not writable:
+                raise TimeoutError("socket send deadline exceeded")
+
+
 # =============================================================================
 # Mux service
 # =============================================================================
@@ -336,6 +432,7 @@ class MeshtasticTcpMux:
         self._next_client_id = 1
         self._upstream_sock: Optional[socket.socket] = None
         self._upstream_lock = threading.Lock()
+        self._upstream_connected = threading.Event()
         self._upstream_state = "starting"
         self._listen_sock: Optional[socket.socket] = None
         self._listener_selector: Optional[selectors.BaseSelector] = None
@@ -344,7 +441,9 @@ class MeshtasticTcpMux:
         self._outbound_thread: Optional[threading.Thread] = None
         self._status_thread: Optional[threading.Thread] = None
         self._health_thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
         self._thread_lock = threading.RLock()
+        self._listener_progress_monotonic = time.monotonic()
 
     def run(self) -> int:
         self._print_startup()
@@ -354,6 +453,7 @@ class MeshtasticTcpMux:
         self._outbound_thread = self._start_thread("outbound", self._outbound_loop)
         self._status_thread = self._start_thread("status", self._status_loop)
         self._health_thread = self._start_thread("health", self._health_loop)
+        self._watchdog_thread = self._start_thread("watchdog", self._watchdog_loop)
 
         try:
             while not self.stop_event.is_set() and not self.exit_event.is_set():
@@ -383,6 +483,7 @@ class MeshtasticTcpMux:
                     self._outbound_thread,
                     self._status_thread,
                     self._health_thread,
+                    self._watchdog_thread,
                 )
                 if thread is not None
             ]
@@ -408,6 +509,7 @@ class MeshtasticTcpMux:
             if self._upstream_sock is not None:
                 close_quietly(self._upstream_sock)
                 self._upstream_sock = None
+                self._upstream_connected.clear()
             self._upstream_state = "stopped"
         with self.selector_lock:
             selector = self._listener_selector
@@ -424,7 +526,7 @@ class MeshtasticTcpMux:
         logging.info("cache replay: %s", "on" if CACHE_REPLAY_TO_NEW_CLIENTS else "off")
         logging.info("client admin filter: %s", "on" if FILTER_CLIENT_ADMIN else "off")
         if mesh_pb2 is None:
-            logging.warning("meshtastic protobuf package not available; packet filtering/summaries are limited")
+            logging.error("meshtastic protobuf package unavailable; enabled packet filters fail closed")
 
     def _upstream_loop(self) -> None:
         parser = FrameParser("upstream")
@@ -439,6 +541,7 @@ class MeshtasticTcpMux:
                 with self._upstream_lock:
                     self._upstream_sock = sock
                     self._upstream_state = "connected"
+                    self._upstream_connected.set()
                 self.stats.inc("upstream_connects")
                 rxbuf.clear()
 
@@ -457,6 +560,7 @@ class MeshtasticTcpMux:
                 with self._upstream_lock:
                     if self._upstream_sock is sock:
                         self._upstream_sock = None
+                        self._upstream_connected.clear()
                     if not self.stop_event.is_set():
                         self._upstream_state = "reconnecting"
                 if sock is not None:
@@ -532,12 +636,16 @@ class MeshtasticTcpMux:
             while not self.stop_event.is_set():
                 with self.selector_lock:
                     events = selector.select(timeout=0.5)
-                for key, _mask in events:
+                self._listener_progress_monotonic = time.monotonic()
+                for key, mask in events:
                     if key.data == "server":
                         self._accept_client(server, selector)
                     else:
                         client: Client = key.data
-                        self._read_client(client, selector, parser)
+                        if mask & selectors.EVENT_READ:
+                            self._read_client(client, selector, parser)
+                        if mask & selectors.EVENT_WRITE:
+                            self._write_client(client, selector)
                 self._drop_idle_clients(selector)
         finally:
             logging.info("listener loop cleaning up")
@@ -705,41 +813,68 @@ class MeshtasticTcpMux:
         if not frames:
             return
 
-        sent = 0
-        try:
-            for frame in frames:
-                send_all(client.sock, frame.raw)
-                client.frames_out += 1
-                client.bytes_out += len(frame.raw)
-                sent += 1
-            self.stats.inc("frames_to_clients", sent)
-            logging.info("replayed %d cached frames to %s", sent, client.name)
-        except Exception as exc:
-            logging.warning("cache replay failed for %s: %s", client.name, exc)
-            self._disconnect_client(client, selector, "cache replay failed")
+        replay: List[bytes] = []
+        replay_bytes = 0
+        for frame in reversed(frames):
+            if replay_bytes + len(frame.raw) > CACHE_REPLAY_MAX_BYTES:
+                break
+            replay.append(frame.raw)
+            replay_bytes += len(frame.raw)
+        replay.reverse()
+        for raw in replay:
+            if not self._queue_client_data(client, raw, selector):
+                return
+        logging.info("queued %d cached frames (%d bytes) for %s", len(replay), replay_bytes, client.name)
 
     def _broadcast(self, data: bytes) -> None:
         with self.clients_lock:
             clients = list(self.clients.values())
 
-        dead: List[Client] = []
-        sent = 0
         for client in clients:
+            self._queue_client_data(client, data, None)
+
+    def _queue_client_data(
+        self,
+        client: Client,
+        data: bytes,
+        selector: Optional[selectors.BaseSelector],
+    ) -> bool:
+        if len(client.txbuf) + len(data) > CLIENT_SEND_QUEUE_MAX_BYTES:
+            self.stats.inc("frames_dropped")
+            self._disconnect_client(client, selector, "slow client send queue full")
+            return False
+        client.txbuf.extend(data)
+        active_selector = selector or self._listener_selector
+        if active_selector is not None:
+            with self.selector_lock:
+                try:
+                    active_selector.modify(client.sock, selectors.EVENT_READ | selectors.EVENT_WRITE, client)
+                except Exception:
+                    self._disconnect_client(client, active_selector, "send queue registration failed")
+                    return False
+        return True
+
+    def _write_client(self, client: Client, selector: selectors.BaseSelector) -> None:
+        if not client.txbuf:
             try:
-                send_all(client.sock, data)
+                selector.modify(client.sock, selectors.EVENT_READ, client)
+            except Exception:
+                self._disconnect_client(client, selector, "write interest update failed")
+            return
+        try:
+            sent = client.sock.send(client.txbuf)
+            if sent <= 0:
+                raise ConnectionError("socket send returned 0")
+            del client.txbuf[:sent]
+            client.bytes_out += sent
+            if not client.txbuf:
                 client.frames_out += 1
-                client.bytes_out += len(data)
-                sent += 1
-            except Exception as exc:
-                logging.info("%s send failed: %s", client.name, exc)
-                dead.append(client)
-
-        if sent:
-            self.stats.inc("frames_to_clients", sent)
-
-        if dead:
-            for client in dead:
-                self._disconnect_client(client, None, "send failed")
+                self.stats.inc("frames_to_clients")
+                selector.modify(client.sock, selectors.EVENT_READ, client)
+        except BlockingIOError:
+            return
+        except Exception as exc:
+            self._disconnect_client(client, selector, f"send failed: {exc}")
 
     def _outbound_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -749,6 +884,11 @@ class MeshtasticTcpMux:
                 continue
 
             try:
+                age = time.time() - item.frame.received_at
+                if age > OUTBOUND_MAX_AGE_SECONDS:
+                    raise TimeoutError(f"queued frame expired after {age:.1f}s")
+                if not self._upstream_connected.wait(OUTBOUND_MAX_AGE_SECONDS - age):
+                    raise TimeoutError("upstream unavailable before frame deadline")
                 self._send_to_upstream(item)
                 self.stats.inc("frames_to_node")
             except Exception as exc:
@@ -767,9 +907,9 @@ class MeshtasticTcpMux:
     def _send_to_upstream(self, item: OutboundItem) -> None:
         with self._upstream_lock:
             sock = self._upstream_sock
-            if sock is None:
-                raise ConnectionError("upstream is not connected")
-            send_all(sock, item.frame.raw)
+        if sock is None:
+            raise ConnectionError("upstream is not connected")
+        send_all_with_deadline(sock, item.frame.raw, UPSTREAM_SEND_TIMEOUT_SECONDS)
 
     def _health_snapshot(self) -> Dict[str, object]:
         with self._thread_lock:
@@ -831,13 +971,27 @@ class MeshtasticTcpMux:
                 logging.warning("health check warning: upstream state is %s", upstream_state)
 
             self._systemd_notify(
-                "WATCHDOG=1\n"
                 f"STATUS=listener_alive={health['listener_alive']} "
                 f"upstream_alive={health['upstream_alive']} "
                 f"listening={health['listening']} "
                 f"client_count={health['client_count']} "
                 f"upstream_state={upstream_state}"
             )
+
+    def _watchdog_loop(self) -> None:
+        """Pet systemd independently of socket, cache, selector, and stats locks."""
+        interval = max(1.0, min(10.0, HEALTH_CHECK_INTERVAL_SECONDS / 2))
+        while not self.stop_event.wait(interval):
+            listener = self._listener_thread
+            progress_age = time.monotonic() - self._listener_progress_monotonic
+            if listener is not None and listener.is_alive() and progress_age < HEALTH_CHECK_INTERVAL_SECONDS:
+                self._systemd_notify("WATCHDOG=1")
+            else:
+                logging.error(
+                    "watchdog not notified: listener_alive=%s progress_age=%.1fs",
+                    listener is not None and listener.is_alive(),
+                    progress_age,
+                )
 
     def _systemd_notify(self, message: str) -> None:
         if not SYSTEMD_WATCHDOG_ENABLED:

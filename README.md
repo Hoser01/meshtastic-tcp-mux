@@ -33,24 +33,24 @@ meshtastic-tcp-mux :4405
 ## Requirements
 
 - Linux host with `systemd`
-- `python3`
+- `python3` and `python3-venv`
 - `unzip`, if installing from the release zip
 - `git`, if installing from source
 - Root/sudo access for installing the service under `/opt` and `/etc/systemd`
 - Network reachability from the mux host to the Meshtastic TCP interface
 
-Optional:
-
-- The Meshtastic Python package. When available to `/usr/bin/python3`, admin
-  packet filtering and packet summaries are more complete:
+- The Meshtastic Python package. The installer creates an isolated virtual
+  environment and installs the version range in `requirements.txt`:
 
 ```bash
-python3 -m pip install meshtastic
+python3 -m venv /opt/meshtastic-tcp-mux/venv
+/opt/meshtastic-tcp-mux/venv/bin/pip install -r requirements.txt
 ```
 
-The mux still runs without the optional package, but packet summaries and
-packet-type filtering are limited. If you install the optional package, make
-sure the same interpreter used by the systemd service can import it.
+The daemon can start without this dependency, but when any protobuf-based
+filter is enabled it fails closed for client frames it cannot classify. This
+prevents an apparently enabled admin filter from silently allowing admin
+traffic.
 
 ## Install from Release Zip
 
@@ -74,12 +74,16 @@ For an explicit fresh install:
 sudo ./install.sh --mode new
 ```
 
-For an upgrade that preserves existing top-of-file configuration values from
+For an upgrade that preserves site settings from
 `/opt/meshtastic-tcp-mux/meshtastic_tcp_mux.py`:
 
 ```bash
 sudo ./install.sh --mode upgrade
 ```
+
+Security defaults `CACHE_REPLAY_TO_NEW_CLIENTS` and
+`ALLOW_RAW_WHEN_PROTOBUF_MISSING` deliberately reset to their new safe values
+instead of migrating legacy defaults.
 
 During an upgrade, the installer creates a timestamped backup under:
 
@@ -218,22 +222,31 @@ sudo rm -rf /opt/meshtastic-tcp-mux
 Default client port is `4405`. This intentionally avoids `4404` so it can be
 tested alongside MeshMonitor's virtual node feature.
 
-The mux forwards Meshtastic stream frames. It is not a web server and does not
-provide an HTTP interface.
+The mux forwards Meshtastic stream frames. It handles downstream
+`ToRadio.disconnect` locally because forwarding a client's session-close
+command would close the one shared upstream session. It is not a web server and
+does not provide an HTTP interface.
 
 Client scripts should connect to the mux machine on TCP port `4405` instead of
 connecting directly to the physical node on `4403`.
 
 ## Safety Defaults
 
-`FILTER_CLIENT_ADMIN` is enabled by default. If the Meshtastic protobuf package
-is available, client-originated admin packets are blocked.
+`FILTER_CLIENT_ADMIN` is enabled by default. Client-originated decoded packets
+on Meshtastic's `ADMIN_APP` port are blocked.
 
 This is meant to reduce the chance of a connected script changing device
 settings through the shared proxy.
 
-If the protobuf package is not installed, the mux can still relay frames, but
-packet summaries and packet-type filtering are limited.
+If protobuf support is unavailable while a filter is enabled, unclassifiable
+client frames are blocked. Set `ALLOW_RAW_WHEN_PROTOBUF_MISSING = True` only if
+you explicitly accept bypassing those filters.
+
+Cache replay is disabled by default. A rolling cache contains transient radio
+events as well as configuration and can make a new consumer process old packets
+again. If enabled for a specialized consumer, replay is queued asynchronously
+and bounded by both frame count and bytes, so a slow client cannot stall the
+radio reader or systemd watchdog.
 
 ## Troubleshooting
 

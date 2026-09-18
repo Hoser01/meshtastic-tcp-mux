@@ -6,6 +6,7 @@ APP_DIR="/opt/${APP_NAME}"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 SRC_FILE="meshtastic_tcp_mux.py"
 VERSION_FILE="VERSION.txt"
+REQUIREMENTS_FILE="requirements.txt"
 MODE=""
 
 usage() {
@@ -71,6 +72,7 @@ if [[ "${MODE}" == "upgrade" && -f "${APP_DIR}/${SRC_FILE}" ]]; then
   mkdir -p "${BACKUP_DIR}"
   cp "${APP_DIR}/${SRC_FILE}" "${BACKUP_DIR}/${SRC_FILE}"
   [[ -f "${APP_DIR}/${VERSION_FILE}" ]] && cp "${APP_DIR}/${VERSION_FILE}" "${BACKUP_DIR}/${VERSION_FILE}"
+  [[ -f "${SERVICE_FILE}" ]] && cp "${SERVICE_FILE}" "${BACKUP_DIR}/${APP_NAME}.service"
   echo "Backed up existing install to ${BACKUP_DIR}"
 elif [[ "${MODE}" == "upgrade" ]]; then
   echo "No existing install found; continuing as a new install."
@@ -85,6 +87,7 @@ chmod 755 "${APP_DIR}/${SRC_FILE}"
 if [[ -f "${VERSION_FILE}" ]]; then
   cp "${VERSION_FILE}" "${APP_DIR}/${VERSION_FILE}"
 fi
+cp "${REQUIREMENTS_FILE}" "${APP_DIR}/${REQUIREMENTS_FILE}"
 
 if [[ "${MODE}" == "upgrade" && -n "${BACKUP_DIR}" ]]; then
   python3 - "${BACKUP_DIR}/${SRC_FILE}" "${APP_DIR}/${SRC_FILE}" <<'PY'
@@ -111,13 +114,16 @@ config_names = {
     "OUTBOUND_DELAY_SECONDS",
     "OUTBOUND_QUEUE_SIZE",
     "DROP_CLIENT_IF_QUEUE_FULL",
-    "CACHE_REPLAY_TO_NEW_CLIENTS",
+    "OUTBOUND_MAX_AGE_SECONDS",
+    "UPSTREAM_SEND_TIMEOUT_SECONDS",
     "CACHE_MAX_FRAMES",
     "CACHE_MAX_AGE_SECONDS",
+    "CACHE_REPLAY_MAX_BYTES",
+    "CLIENT_SEND_QUEUE_MAX_BYTES",
     "FILTER_CLIENT_ADMIN",
     "FILTER_CLIENT_CONFIG",
     "FILTER_CLIENT_MODULE_CONFIG",
-    "ALLOW_RAW_WHEN_PROTOBUF_MISSING",
+    "BLOCK_CLIENT_DISCONNECT",
     "LOG_LEVEL",
     "LOG_HEX_FRAMES",
     "LOG_FRAME_SUMMARY",
@@ -161,6 +167,11 @@ print("Migrated config values: " + ", ".join(changed))
 PY
 fi
 
+if [[ ! -x "${APP_DIR}/venv/bin/python" ]]; then
+  python3 -m venv "${APP_DIR}/venv"
+fi
+"${APP_DIR}/venv/bin/python" -m pip install --disable-pip-version-check -r "${APP_DIR}/${REQUIREMENTS_FILE}"
+
 cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=Meshtastic TCP Mux
@@ -171,7 +182,7 @@ Wants=network-online.target
 Type=notify
 NotifyAccess=main
 WorkingDirectory=${APP_DIR}
-ExecStart=/usr/bin/python3 ${APP_DIR}/${SRC_FILE}
+ExecStart=${APP_DIR}/venv/bin/python ${APP_DIR}/${SRC_FILE}
 Restart=always
 RestartSec=5
 WatchdogSec=60
@@ -185,8 +196,8 @@ EOF
 systemctl daemon-reload
 systemctl enable "${APP_NAME}.service"
 
-python3 "${APP_DIR}/${SRC_FILE}" --version
-python3 "${APP_DIR}/${SRC_FILE}" --check
+"${APP_DIR}/venv/bin/python" "${APP_DIR}/${SRC_FILE}" --version
+"${APP_DIR}/venv/bin/python" "${APP_DIR}/${SRC_FILE}" --check
 
 echo
 read -r -p "Start ${APP_NAME} now? [Y/n] " START_NOW
