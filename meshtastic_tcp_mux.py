@@ -845,11 +845,14 @@ class MeshtasticTcpMux:
             if len(client.txbuf) + len(data) > CLIENT_SEND_QUEUE_MAX_BYTES:
                 queue_full = True
             else:
+                was_empty = not client.txbuf
                 client.txbuf.extend(data)
         if queue_full:
             self.stats.inc("frames_dropped")
             self._disconnect_client(client, selector, "slow client send queue full")
             return False
+        if not was_empty:
+            return True
         active_selector = selector or self._listener_selector
         if active_selector is not None:
             with self.selector_lock:
