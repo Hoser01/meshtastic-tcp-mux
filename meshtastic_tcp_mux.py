@@ -465,6 +465,7 @@ class MeshtasticTcpMux:
         self._watchdog_thread: Optional[threading.Thread] = None
         self._thread_lock = threading.RLock()
         self._listener_progress_monotonic = time.monotonic()
+        self._local_node_num: Optional[int] = None
         self.audit: Optional[AuditServer] = None
         if AUDIT_ENABLED:
             self.audit = AuditServer(
@@ -630,6 +631,8 @@ class MeshtasticTcpMux:
         frame = normalize_frame(frame)
         self.stats.inc("frames_from_node")
         metadata, parsed = decode_frame("radio_to_clients", frame.payload)
+        if parsed is not None and parsed.HasField("my_info"):
+            self._local_node_num = int(parsed.my_info.my_node_num)
         event = "queue_status" if parsed is not None and parsed.HasField("queueStatus") else "radio_frame"
         self._audit(event, "radio_to_clients", "forwarded", **metadata)
         self._cache_frame(frame)
@@ -794,6 +797,7 @@ class MeshtasticTcpMux:
         allowed, reason = client_frame_allowed(frame)
         summary = summarize_payload("to_radio", frame.payload)
         metadata, _parsed = decode_frame("client_to_radio", frame.payload)
+        metadata = self._enrich_outbound_metadata(metadata)
 
         if not allowed:
             self.stats.inc("frames_blocked")
@@ -998,6 +1002,7 @@ class MeshtasticTcpMux:
                 self._send_to_upstream(item)
                 self.stats.inc("frames_to_node")
                 metadata, _parsed = decode_frame("client_to_radio", item.frame.payload)
+                metadata = self._enrich_outbound_metadata(metadata)
                 self._audit(
                     "forward_result",
                     "client_to_radio",
@@ -1015,6 +1020,7 @@ class MeshtasticTcpMux:
                     exc,
                 )
                 metadata, _parsed = decode_frame("client_to_radio", item.frame.payload)
+                metadata = self._enrich_outbound_metadata(metadata)
                 self._audit(
                     "forward_result",
                     "client_to_radio",
@@ -1174,6 +1180,19 @@ class MeshtasticTcpMux:
     ) -> None:
         if self.audit is not None:
             self.audit.emit(audit_record(event, direction, disposition, **values))
+
+    def _enrich_outbound_metadata(self, metadata: Dict[str, object]) -> Dict[str, object]:
+        """Resolve Meshtastic's local-source sentinel while marking provenance."""
+        if metadata.get("from_node") != 0 or self._local_node_num is None:
+            return metadata
+        enriched = dict(metadata)
+        source = self._local_node_num
+        packet_id = int(enriched.get("packet_id", 0))
+        enriched["from_node"] = source
+        enriched["from_id"] = f"!{source & 0xffffffff:08x}"
+        enriched["source_inferred_from_upstream"] = True
+        enriched["correlation_id"] = f"packet:{source & 0xffffffff:08x}:{packet_id & 0xffffffff:08x}"
+        return enriched
 
 
 # =============================================================================

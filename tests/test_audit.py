@@ -112,6 +112,20 @@ class SafeDecodeTests(unittest.TestCase):
         self.assertEqual(blocked[0]["disposition"], "blocked")
         self.assertNotIn("admin-private", json.dumps(blocked))
 
+    def test_local_source_sentinel_is_resolved_with_provenance(self):
+        service = mux.MeshtasticTcpMux()
+        service._local_node_num = 0xA2E9F268
+        metadata = {
+            "packet_id": 0x12345678,
+            "from_node": 0,
+            "from_id": "!00000000",
+            "correlation_id": "packet:00000000:12345678",
+        }
+        enriched = service._enrich_outbound_metadata(metadata)
+        self.assertEqual(enriched["from_id"], "!a2e9f268")
+        self.assertTrue(enriched["source_inferred_from_upstream"])
+        self.assertEqual(enriched["correlation_id"], "packet:a2e9f268:12345678")
+
     def test_malformed_frame_reports_class_only(self):
         metadata, parsed = audit.decode_frame("client_to_radio", b"\xff")
         self.assertIsNone(parsed)

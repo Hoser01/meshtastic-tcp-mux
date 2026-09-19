@@ -335,6 +335,12 @@ records may include packet/node IDs, application/port, channel, hop fields,
 ack/MQTT flags, encryption state, transport, RSSI/SNR, request/reply IDs, and a
 stable packet correlation ID.
 
+Meshtastic clients commonly submit locally originated packets with source node
+zero and let the radio fill it. After the MUX observes the upstream radio's
+`my_info`, audit records replace that sentinel with the local node number and
+set `source_inferred_from_upstream=true` so consumers can distinguish the
+inference from an explicit client-supplied source.
+
 Example outbound evidence:
 
 ```json
