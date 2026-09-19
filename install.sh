@@ -7,14 +7,18 @@ SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 SRC_FILE="meshtastic_tcp_mux.py"
 VERSION_FILE="VERSION.txt"
 REQUIREMENTS_FILE="requirements.txt"
+AUDIT_FILE="audit_stream.py"
+DEFAULT_FILE="/etc/default/${APP_NAME}"
 MODE=""
+ENABLE_AUDIT="false"
 
 usage() {
   cat <<EOF
-Usage: sudo ./install.sh [--mode new|upgrade]
+Usage: sudo ./install.sh [--mode new|upgrade] [--enable-audit]
 
   new      Replace any existing install with this release.
   upgrade  Back up the installed app and preserve existing config values.
+  --enable-audit  Enable the localhost-only NDJSON audit stream on port 4406.
 EOF
 }
 
@@ -26,6 +30,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mode=*)
       MODE="${1#*=}"
+      shift
+      ;;
+    --enable-audit)
+      ENABLE_AUDIT="true"
       shift
       ;;
     -h|--help)
@@ -73,6 +81,7 @@ if [[ "${MODE}" == "upgrade" && -f "${APP_DIR}/${SRC_FILE}" ]]; then
   cp "${APP_DIR}/${SRC_FILE}" "${BACKUP_DIR}/${SRC_FILE}"
   [[ -f "${APP_DIR}/${VERSION_FILE}" ]] && cp "${APP_DIR}/${VERSION_FILE}" "${BACKUP_DIR}/${VERSION_FILE}"
   [[ -f "${SERVICE_FILE}" ]] && cp "${SERVICE_FILE}" "${BACKUP_DIR}/${APP_NAME}.service"
+  [[ -f "${DEFAULT_FILE}" ]] && cp "${DEFAULT_FILE}" "${BACKUP_DIR}/${APP_NAME}.default"
   echo "Backed up existing install to ${BACKUP_DIR}"
 elif [[ "${MODE}" == "upgrade" ]]; then
   echo "No existing install found; continuing as a new install."
@@ -88,6 +97,7 @@ if [[ -f "${VERSION_FILE}" ]]; then
   cp "${VERSION_FILE}" "${APP_DIR}/${VERSION_FILE}"
 fi
 cp "${REQUIREMENTS_FILE}" "${APP_DIR}/${REQUIREMENTS_FILE}"
+cp "${AUDIT_FILE}" "${APP_DIR}/${AUDIT_FILE}"
 
 if [[ "${MODE}" == "upgrade" && -n "${BACKUP_DIR}" ]]; then
   python3 - "${BACKUP_DIR}/${SRC_FILE}" "${APP_DIR}/${SRC_FILE}" <<'PY'
@@ -172,6 +182,18 @@ if [[ ! -x "${APP_DIR}/venv/bin/python" ]]; then
 fi
 "${APP_DIR}/venv/bin/python" -m pip install --disable-pip-version-check -r "${APP_DIR}/${REQUIREMENTS_FILE}"
 
+if [[ ! -f "${DEFAULT_FILE}" || "${ENABLE_AUDIT}" == "true" ]]; then
+  cat > "${DEFAULT_FILE}" <<EOF
+MESHTASTIC_MUX_AUDIT_ENABLED=${ENABLE_AUDIT}
+MESHTASTIC_MUX_AUDIT_HOST=127.0.0.1
+MESHTASTIC_MUX_AUDIT_PORT=4406
+MESHTASTIC_MUX_AUDIT_QUEUE_SIZE=1000
+MESHTASTIC_MUX_AUDIT_MAX_CONSUMERS=4
+MESHTASTIC_MUX_AUDIT_SEND_TIMEOUT_SECONDS=1
+EOF
+  chmod 0644 "${DEFAULT_FILE}"
+fi
+
 cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=Meshtastic TCP Mux
@@ -182,6 +204,7 @@ Wants=network-online.target
 Type=notify
 NotifyAccess=main
 WorkingDirectory=${APP_DIR}
+EnvironmentFile=-${DEFAULT_FILE}
 ExecStart=${APP_DIR}/venv/bin/python ${APP_DIR}/${SRC_FILE}
 Restart=always
 RestartSec=5

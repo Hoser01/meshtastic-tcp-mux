@@ -27,6 +27,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, Iterable, List, Optional, Tuple
 
+from audit_stream import AuditServer, audit_record, decode_frame
+
 
 # =============================================================================
 # Configuration
@@ -78,12 +80,19 @@ HEADER_LEN = 4
 MAX_FRAME_SIZE = 512
 
 SERVICE_NAME = "meshtastic-tcp-mux"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 HEALTH_CHECK_INTERVAL_SECONDS = 15
 LISTENER_RESTART_DELAY_SECONDS = 2
 LISTENER_MAX_CONSECUTIVE_FAILURES = 3
 SYSTEMD_WATCHDOG_ENABLED = True
+
+AUDIT_ENABLED = os.environ.get("MESHTASTIC_MUX_AUDIT_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+AUDIT_HOST = os.environ.get("MESHTASTIC_MUX_AUDIT_HOST", "127.0.0.1")
+AUDIT_PORT = int(os.environ.get("MESHTASTIC_MUX_AUDIT_PORT", "4406"))
+AUDIT_QUEUE_SIZE = int(os.environ.get("MESHTASTIC_MUX_AUDIT_QUEUE_SIZE", "1000"))
+AUDIT_MAX_CONSUMERS = int(os.environ.get("MESHTASTIC_MUX_AUDIT_MAX_CONSUMERS", "4"))
+AUDIT_SEND_TIMEOUT_SECONDS = float(os.environ.get("MESHTASTIC_MUX_AUDIT_SEND_TIMEOUT_SECONDS", "1"))
 
 
 # =============================================================================
@@ -386,6 +395,17 @@ def close_quietly(sock: socket.socket) -> None:
         pass
 
 
+def safe_disconnect_reason(reason: str) -> str:
+    value = reason.lower()
+    if value in ("closed", "idle timeout", "service stopping", "listener restarting"):
+        return value.replace(" ", "_")
+    if "queue" in value:
+        return "queue_limit"
+    if "send" in value or "broken pipe" in value:
+        return "send_failure"
+    return "socket_error"
+
+
 def send_all(sock: socket.socket, data: bytes) -> None:
     view = memoryview(data)
     while view:
@@ -445,9 +465,21 @@ class MeshtasticTcpMux:
         self._watchdog_thread: Optional[threading.Thread] = None
         self._thread_lock = threading.RLock()
         self._listener_progress_monotonic = time.monotonic()
+        self.audit: Optional[AuditServer] = None
+        if AUDIT_ENABLED:
+            self.audit = AuditServer(
+                AUDIT_HOST,
+                AUDIT_PORT,
+                AUDIT_QUEUE_SIZE,
+                AUDIT_MAX_CONSUMERS,
+                AUDIT_SEND_TIMEOUT_SECONDS,
+            )
 
     def run(self) -> int:
         self._print_startup()
+
+        if self.audit is not None:
+            self.audit.start()
 
         self._upstream_thread = self._start_thread("upstream", self._upstream_loop)
         self._start_listener_thread()
@@ -506,6 +538,8 @@ class MeshtasticTcpMux:
 
     def stop(self) -> None:
         self.stop_event.set()
+        if self.audit is not None:
+            self.audit.stop()
         with self._upstream_lock:
             if self._upstream_sock is not None:
                 close_quietly(self._upstream_sock)
@@ -526,6 +560,11 @@ class MeshtasticTcpMux:
         logging.info("max clients: %d", MAX_CLIENTS)
         logging.info("cache replay: %s", "on" if CACHE_REPLAY_TO_NEW_CLIENTS else "off")
         logging.info("client admin filter: %s", "on" if FILTER_CLIENT_ADMIN else "off")
+        logging.info(
+            "audit stream: %s%s",
+            "on" if self.audit is not None else "off",
+            f" ({AUDIT_HOST}:{AUDIT_PORT})" if self.audit is not None else "",
+        )
         if mesh_pb2 is None:
             logging.error("meshtastic protobuf package unavailable; enabled packet filters fail closed")
 
@@ -544,6 +583,7 @@ class MeshtasticTcpMux:
                     self._upstream_state = "connected"
                     self._upstream_connected.set()
                 self.stats.inc("upstream_connects")
+                self._audit("upstream_connected", disposition="connected")
                 rxbuf.clear()
 
                 while not self.stop_event.is_set():
@@ -556,6 +596,11 @@ class MeshtasticTcpMux:
             except Exception as exc:
                 if not self.stop_event.is_set():
                     logging.warning("upstream disconnected: %s", exc)
+                    self._audit(
+                        "upstream_disconnected",
+                        disposition="failed",
+                        error=exc.__class__.__name__,
+                    )
                 self.stats.inc("upstream_disconnects")
             finally:
                 with self._upstream_lock:
@@ -584,6 +629,9 @@ class MeshtasticTcpMux:
     def _handle_upstream_frame(self, frame: Frame) -> None:
         frame = normalize_frame(frame)
         self.stats.inc("frames_from_node")
+        metadata, parsed = decode_frame("radio_to_clients", frame.payload)
+        event = "queue_status" if parsed is not None and parsed.HasField("queueStatus") else "radio_frame"
+        self._audit(event, "radio_to_clients", "forwarded", **metadata)
         self._cache_frame(frame)
 
         summary = summarize_payload("from_radio", frame.payload)
@@ -715,6 +763,7 @@ class MeshtasticTcpMux:
             raise
         self.stats.inc("client_connects")
         logging.info("%s connected", client.name)
+        self._audit("client_connected", client_id=client.cid, disposition="connected")
 
         if CACHE_REPLAY_TO_NEW_CLIENTS:
             self._replay_cache(client, selector)
@@ -744,10 +793,19 @@ class MeshtasticTcpMux:
 
         allowed, reason = client_frame_allowed(frame)
         summary = summarize_payload("to_radio", frame.payload)
+        metadata, _parsed = decode_frame("client_to_radio", frame.payload)
 
         if not allowed:
             self.stats.inc("frames_blocked")
             logging.warning("%s blocked: %s (%s)", client.name, reason, summary)
+            self._audit(
+                "client_frame_blocked",
+                "client_to_radio",
+                "blocked",
+                client_id=client.cid,
+                policy_reason=reason,
+                **metadata,
+            )
             return
 
         if summary:
@@ -758,9 +816,24 @@ class MeshtasticTcpMux:
         item = OutboundItem(client_id=client.cid, client_addr=client.addr, frame=frame)
         try:
             self.outbound.put_nowait(item)
+            self._audit(
+                "client_frame",
+                "client_to_radio",
+                "queued",
+                client_id=client.cid,
+                **metadata,
+            )
         except queue.Full:
             self.stats.inc("frames_dropped")
             logging.warning("outbound queue full; dropping frame from %s", client.name)
+            self._audit(
+                "forwarding_error",
+                "client_to_radio",
+                "failed",
+                client_id=client.cid,
+                error="OutboundQueueFull",
+                **metadata,
+            )
             if DROP_CLIENT_IF_QUEUE_FULL:
                 self._disconnect_client(client, selector, "outbound queue full")
 
@@ -784,6 +857,12 @@ class MeshtasticTcpMux:
         close_quietly(client.sock)
         self.stats.inc("client_disconnects")
         logging.info("%s disconnected: %s", client.name, reason)
+        self._audit(
+            "client_disconnected",
+            client_id=client.cid,
+            disposition="disconnected",
+            reason=safe_disconnect_reason(reason),
+        )
 
     def _close_all_clients(self, selector: Optional[selectors.BaseSelector], reason: str) -> None:
         with self.clients_lock:
@@ -795,6 +874,12 @@ class MeshtasticTcpMux:
             close_quietly(client.sock)
             self.stats.inc("client_disconnects")
             logging.info("%s disconnected: %s", client.name, reason)
+            self._audit(
+                "client_disconnected",
+                client_id=client.cid,
+                disposition="disconnected",
+                reason="service_or_listener_close",
+            )
 
     def _drop_idle_clients(self, selector: selectors.BaseSelector) -> None:
         if CLIENT_IDLE_TIMEOUT_SECONDS <= 0:
@@ -912,6 +997,14 @@ class MeshtasticTcpMux:
                     raise TimeoutError("upstream unavailable before frame deadline")
                 self._send_to_upstream(item)
                 self.stats.inc("frames_to_node")
+                metadata, _parsed = decode_frame("client_to_radio", item.frame.payload)
+                self._audit(
+                    "forward_result",
+                    "client_to_radio",
+                    "forwarded",
+                    client_id=item.client_id,
+                    **metadata,
+                )
             except Exception as exc:
                 self.stats.inc("frames_dropped")
                 logging.warning(
@@ -920,6 +1013,15 @@ class MeshtasticTcpMux:
                     item.client_addr[0],
                     item.client_addr[1],
                     exc,
+                )
+                metadata, _parsed = decode_frame("client_to_radio", item.frame.payload)
+                self._audit(
+                    "forward_result",
+                    "client_to_radio",
+                    "failed",
+                    client_id=item.client_id,
+                    error=exc.__class__.__name__,
+                    **metadata,
                 )
             finally:
                 if OUTBOUND_DELAY_SECONDS > 0:
@@ -1039,8 +1141,13 @@ class MeshtasticTcpMux:
                 break
             snap = self.stats.snapshot()
             health = self._health_snapshot()
+            audit = self.audit.snapshot() if self.audit is not None else {
+                "audit_consumers": 0,
+                "audit_events": 0,
+                "audit_dropped": 0,
+            }
             logging.info(
-                "status: up=%ss listener_alive=%s upstream_alive=%s listening=%s client_count=%d upstream_state=%s node_rx=%d node_tx=%d client_rx=%d client_tx=%d blocked=%d dropped=%d",
+                "status: up=%ss listener_alive=%s upstream_alive=%s listening=%s client_count=%d upstream_state=%s node_rx=%d node_tx=%d client_rx=%d client_tx=%d blocked=%d dropped=%d audit_consumers=%d audit_events=%d audit_dropped=%d",
                 snap["uptime_seconds"],
                 health["listener_alive"],
                 health["upstream_alive"],
@@ -1053,7 +1160,20 @@ class MeshtasticTcpMux:
                 snap["frames_to_clients"],
                 snap["frames_blocked"],
                 snap["frames_dropped"],
+                audit["audit_consumers"],
+                audit["audit_events"],
+                audit["audit_dropped"],
             )
+
+    def _audit(
+        self,
+        event: str,
+        direction: Optional[str] = None,
+        disposition: Optional[str] = None,
+        **values: object,
+    ) -> None:
+        if self.audit is not None:
+            self.audit.emit(audit_record(event, direction, disposition, **values))
 
 
 # =============================================================================
@@ -1091,6 +1211,11 @@ def show_config() -> None:
     print(f"FILTER_CLIENT_MODULE_CONFIG={FILTER_CLIENT_MODULE_CONFIG}")
     print(f"HEALTH_CHECK_INTERVAL_SECONDS={HEALTH_CHECK_INTERVAL_SECONDS}")
     print(f"SYSTEMD_WATCHDOG_ENABLED={SYSTEMD_WATCHDOG_ENABLED}")
+    print(f"AUDIT_ENABLED={AUDIT_ENABLED}")
+    print(f"AUDIT_HOST={AUDIT_HOST}")
+    print(f"AUDIT_PORT={AUDIT_PORT}")
+    print(f"AUDIT_QUEUE_SIZE={AUDIT_QUEUE_SIZE}")
+    print(f"AUDIT_MAX_CONSUMERS={AUDIT_MAX_CONSUMERS}")
     print(f"START1=0x{START1:02X}")
     print(f"START2=0x{START2:02X}")
     print(f"ALT_START2_VALUES={[hex(v) for v in ALT_START2_VALUES]}")

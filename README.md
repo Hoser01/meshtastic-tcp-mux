@@ -298,3 +298,77 @@ sudo ss -ltnp | grep 4405
 
 Losing the upstream node connection should show the upstream state as
 `reconnecting`, but it should not kill the listener on port `4405`.
+
+## Metadata Audit Stream
+
+The optional audit stream gives local observability tools evidence about both
+directions of the MUX without putting `ToRadio` commands into ordinary
+Meshtastic client streams. It is disabled by default and supports multiple
+read-only consumers using versioned newline-delimited JSON (NDJSON).
+
+Enable it during installation:
+
+```bash
+sudo ./install.sh --mode upgrade --enable-audit
+```
+
+Or configure `/etc/default/meshtastic-tcp-mux` and restart the service:
+
+```ini
+MESHTASTIC_MUX_AUDIT_ENABLED=true
+MESHTASTIC_MUX_AUDIT_HOST=127.0.0.1
+MESHTASTIC_MUX_AUDIT_PORT=4406
+MESHTASTIC_MUX_AUDIT_QUEUE_SIZE=1000
+MESHTASTIC_MUX_AUDIT_MAX_CONSUMERS=4
+MESHTASTIC_MUX_AUDIT_SEND_TIMEOUT_SECONDS=1
+```
+
+The implementation rejects non-loopback bind addresses. Audit clients must not
+write to the connection; a consumer that writes is disconnected. The example
+consumer is `examples/audit_consumer.py`.
+
+### Schema and evidence model
+
+Every record contains `schema_version`, `event`, and a UTC `observed_at` value.
+Directional records include `direction` and `disposition`. Packet-bearing
+records may include packet/node IDs, application/port, channel, hop fields,
+ack/MQTT flags, encryption state, transport, RSSI/SNR, request/reply IDs, and a
+stable packet correlation ID.
+
+Example outbound evidence:
+
+```json
+{"application":"TEXT_MESSAGE_APP","channel":0,"correlation_id":"packet:a2e9f268:10203040","direction":"client_to_radio","disposition":"queued","encrypted":false,"event":"client_frame","from_id":"!a2e9f268","packet_id":270544960,"schema_version":1,"to_id":"!a0352614"}
+```
+
+Example radio queue evidence:
+
+```json
+{"direction":"radio_to_clients","disposition":"forwarded","event":"queue_status","queue":{"free":15,"maxlen":16,"mesh_packet_id":270544960,"result":0},"schema_version":1}
+```
+
+These are observations, not delivery claims. `queued` means the MUX accepted a
+client frame; `forwarded` means bytes were written to the upstream TCP socket.
+Neither proves an RF transmission, route, acknowledgement, or final delivery.
+A later queue, routing, RF, or MQTT observation can be associated by packet ID,
+request/reply ID, and correlation ID when those fields exist.
+
+### Privacy and threat model
+
+The stream never includes decoded application payload bytes, text contents,
+encrypted bodies, channel keys, PSKs, admin/configuration contents, owner
+secrets, Wi-Fi credentials, or MQTT credentials. Errors are reduced to stable
+categories or exception class names. There is no raw-frame mode.
+
+Audit queues are bounded per consumer. A slow consumer loses audit events and
+increments `audit_dropped`; it cannot block the radio or ordinary clients.
+Drop warnings are rate-limited and `audit_queue_drop` records are offered to
+other healthy consumers.
+
+Schema version 1 only gains optional fields. A breaking rename, removal, type
+change, or semantic change requires a new `schema_version`. Consumers should
+ignore unknown fields and reject unsupported major schema versions.
+
+The stream can report only evidence seen by this MUX: traffic from its attached
+radio, connected clients, and any MQTT path represented in those frames. It
+cannot reveal traffic those sources never deliver to the MUX.
