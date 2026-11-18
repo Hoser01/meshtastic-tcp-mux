@@ -144,6 +144,41 @@ class UpstreamQueueTests(unittest.TestCase):
         self.assertTrue(sent.is_set())
 
 
+class UpstreamIdleWatchdogTests(unittest.TestCase):
+    def test_stale_connected_socket_is_closed_for_reconnect(self):
+        service = mux.MeshtasticTcpMux()
+        left, right = socket.socketpair()
+        self.addCleanup(right.close)
+        with service._upstream_lock:
+            service._upstream_sock = left
+            service._upstream_state = "connected"
+            service._upstream_last_rx_monotonic = time.monotonic() - 10
+
+        with mock.patch.object(mux, "UPSTREAM_IDLE_TIMEOUT_SECONDS", 5):
+            self.assertTrue(service._reconnect_idle_upstream())
+
+        self.assertEqual(service._upstream_state, "idle-reconnecting")
+        self.assertIsNone(service._upstream_last_rx_monotonic)
+        self.assertEqual(service.stats.snapshot()["upstream_idle_reconnects"], 1)
+        self.assertEqual(left.fileno(), -1)
+
+    def test_recent_or_disabled_upstream_is_not_closed(self):
+        service = mux.MeshtasticTcpMux()
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        with service._upstream_lock:
+            service._upstream_sock = left
+            service._upstream_last_rx_monotonic = time.monotonic()
+
+        with mock.patch.object(mux, "UPSTREAM_IDLE_TIMEOUT_SECONDS", 5):
+            self.assertFalse(service._reconnect_idle_upstream())
+        with mock.patch.object(mux, "UPSTREAM_IDLE_TIMEOUT_SECONDS", 0):
+            service._upstream_last_rx_monotonic = time.monotonic() - 100
+            self.assertFalse(service._reconnect_idle_upstream())
+        self.assertGreaterEqual(left.fileno(), 0)
+
+
 class ServiceIntegrationTests(unittest.TestCase):
     def test_new_and_closing_client_does_not_reset_shared_upstream(self):
         radio_listener = socket.socket()

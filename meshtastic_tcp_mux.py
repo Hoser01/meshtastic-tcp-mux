@@ -48,6 +48,7 @@ UPSTREAM_RECV_BUFFER = 4096
 RECONNECT_DELAY_SECONDS = 5
 CONNECT_TIMEOUT_SECONDS = 8
 SOCKET_KEEPALIVE = True
+UPSTREAM_IDLE_TIMEOUT_SECONDS = 300   # 0 disables stale upstream recovery
 
 OUTBOUND_DELAY_SECONDS = 0.35          # spacing between client-originated frames
 OUTBOUND_QUEUE_SIZE = 500
@@ -80,7 +81,7 @@ HEADER_LEN = 4
 MAX_FRAME_SIZE = 512
 
 SERVICE_NAME = "meshtastic-tcp-mux"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 HEALTH_CHECK_INTERVAL_SECONDS = 15
 LISTENER_RESTART_DELAY_SECONDS = 2
@@ -150,6 +151,7 @@ class Stats:
         self.started_at = time.time()
         self.upstream_connects = 0
         self.upstream_disconnects = 0
+        self.upstream_idle_reconnects = 0
         self.frames_from_node = 0
         self.frames_to_node = 0
         self.frames_from_clients = 0
@@ -170,6 +172,7 @@ class Stats:
                 "uptime_seconds": round(time.time() - self.started_at, 1),
                 "upstream_connects": self.upstream_connects,
                 "upstream_disconnects": self.upstream_disconnects,
+                "upstream_idle_reconnects": self.upstream_idle_reconnects,
                 "frames_from_node": self.frames_from_node,
                 "frames_to_node": self.frames_to_node,
                 "frames_from_clients": self.frames_from_clients,
@@ -455,6 +458,7 @@ class MeshtasticTcpMux:
         self._upstream_lock = threading.Lock()
         self._upstream_connected = threading.Event()
         self._upstream_state = "starting"
+        self._upstream_last_rx_monotonic: Optional[float] = None
         self._listen_sock: Optional[socket.socket] = None
         self._listener_selector: Optional[selectors.BaseSelector] = None
         self._listener_thread: Optional[threading.Thread] = None
@@ -559,6 +563,10 @@ class MeshtasticTcpMux:
         logging.info("upstream node: %s:%d", REAL_NODE_HOST, REAL_NODE_PORT)
         logging.info("listen: %s:%d", LISTEN_HOST, LISTEN_PORT)
         logging.info("max clients: %d", MAX_CLIENTS)
+        logging.info(
+            "upstream idle watchdog: %s",
+            f"{UPSTREAM_IDLE_TIMEOUT_SECONDS}s" if UPSTREAM_IDLE_TIMEOUT_SECONDS > 0 else "off",
+        )
         logging.info("cache replay: %s", "on" if CACHE_REPLAY_TO_NEW_CLIENTS else "off")
         logging.info("client admin filter: %s", "on" if FILTER_CLIENT_ADMIN else "off")
         logging.info(
@@ -582,6 +590,7 @@ class MeshtasticTcpMux:
                 with self._upstream_lock:
                     self._upstream_sock = sock
                     self._upstream_state = "connected"
+                    self._upstream_last_rx_monotonic = time.monotonic()
                     self._upstream_connected.set()
                 self.stats.inc("upstream_connects")
                 self._audit("upstream_connected", disposition="connected")
@@ -591,6 +600,9 @@ class MeshtasticTcpMux:
                     data = sock.recv(UPSTREAM_RECV_BUFFER)
                     if not data:
                         raise ConnectionError("upstream closed")
+                    with self._upstream_lock:
+                        if self._upstream_sock is sock:
+                            self._upstream_last_rx_monotonic = time.monotonic()
                     for frame in parser.feed(rxbuf, data):
                         self._handle_upstream_frame(frame)
 
@@ -607,6 +619,7 @@ class MeshtasticTcpMux:
                 with self._upstream_lock:
                     if self._upstream_sock is sock:
                         self._upstream_sock = None
+                        self._upstream_last_rx_monotonic = None
                         self._upstream_connected.clear()
                     if not self.stop_event.is_set():
                         self._upstream_state = "reconnecting"
@@ -1049,6 +1062,11 @@ class MeshtasticTcpMux:
         with self._upstream_lock:
             upstream_state = self._upstream_state
             upstream_connected = self._upstream_sock is not None
+            upstream_rx_age = (
+                max(0.0, time.monotonic() - self._upstream_last_rx_monotonic)
+                if self._upstream_last_rx_monotonic is not None
+                else None
+            )
         listening = self._listen_socket_bound()
         return {
             "listener_alive": listener_alive,
@@ -1057,7 +1075,48 @@ class MeshtasticTcpMux:
             "client_count": client_count,
             "upstream_state": upstream_state,
             "upstream_connected": upstream_connected,
+            "upstream_rx_age_seconds": upstream_rx_age,
         }
+
+    def _reconnect_idle_upstream(self) -> bool:
+        """Break a half-open radio session after prolonged receive inactivity."""
+        if UPSTREAM_IDLE_TIMEOUT_SECONDS <= 0:
+            return False
+
+        with self._upstream_lock:
+            sock = self._upstream_sock
+            last_rx = self._upstream_last_rx_monotonic
+            if sock is None or last_rx is None:
+                return False
+            idle_age = time.monotonic() - last_rx
+            if idle_age < UPSTREAM_IDLE_TIMEOUT_SECONDS:
+                return False
+
+            # Leave ownership with the upstream loop, but invalidate progress so
+            # another health pass cannot trip the same connection twice. Closing
+            # the socket unblocks recv(), which then performs normal cleanup and
+            # reconnects without disturbing downstream client sessions.
+            self._upstream_last_rx_monotonic = None
+            self._upstream_state = "idle-reconnecting"
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            close_quietly(sock)
+
+        self.stats.inc("upstream_idle_reconnects")
+        logging.warning(
+            "upstream receive idle for %.1fs (limit=%ss); forcing reconnect",
+            idle_age,
+            UPSTREAM_IDLE_TIMEOUT_SECONDS,
+        )
+        self._audit(
+            "upstream_idle_timeout",
+            disposition="reconnecting",
+            idle_seconds=round(idle_age, 1),
+            timeout_seconds=UPSTREAM_IDLE_TIMEOUT_SECONDS,
+        )
+        return True
 
     def _listen_socket_bound(self) -> bool:
         with self.selector_lock:
@@ -1073,6 +1132,7 @@ class MeshtasticTcpMux:
     def _health_loop(self) -> None:
         self._systemd_notify("READY=1\nSTATUS=meshtastic-tcp-mux running")
         while not self.stop_event.wait(HEALTH_CHECK_INTERVAL_SECONDS):
+            self._reconnect_idle_upstream()
             health = self._health_snapshot()
             if not health["listener_alive"]:
                 logging.error("health check failed: listener thread dead")
@@ -1096,7 +1156,7 @@ class MeshtasticTcpMux:
                 break
 
             upstream_state = str(health["upstream_state"])
-            if upstream_state not in ("connected", "reconnecting"):
+            if upstream_state not in ("connected", "reconnecting", "idle-reconnecting"):
                 logging.warning("health check warning: upstream state is %s", upstream_state)
 
             self._systemd_notify(
@@ -1153,13 +1213,15 @@ class MeshtasticTcpMux:
                 "audit_dropped": 0,
             }
             logging.info(
-                "status: up=%ss listener_alive=%s upstream_alive=%s listening=%s client_count=%d upstream_state=%s node_rx=%d node_tx=%d client_rx=%d client_tx=%d blocked=%d dropped=%d audit_consumers=%d audit_events=%d audit_dropped=%d",
+                "status: up=%ss listener_alive=%s upstream_alive=%s listening=%s client_count=%d upstream_state=%s upstream_rx_age=%s idle_reconnects=%d node_rx=%d node_tx=%d client_rx=%d client_tx=%d blocked=%d dropped=%d audit_consumers=%d audit_events=%d audit_dropped=%d",
                 snap["uptime_seconds"],
                 health["listener_alive"],
                 health["upstream_alive"],
                 health["listening"],
                 health["client_count"],
                 health["upstream_state"],
+                f"{health['upstream_rx_age_seconds']:.1f}s" if health["upstream_rx_age_seconds"] is not None else "n/a",
+                snap["upstream_idle_reconnects"],
                 snap["frames_from_node"],
                 snap["frames_to_node"],
                 snap["frames_from_clients"],
@@ -1229,6 +1291,7 @@ def show_config() -> None:
     print(f"FILTER_CLIENT_CONFIG={FILTER_CLIENT_CONFIG}")
     print(f"FILTER_CLIENT_MODULE_CONFIG={FILTER_CLIENT_MODULE_CONFIG}")
     print(f"HEALTH_CHECK_INTERVAL_SECONDS={HEALTH_CHECK_INTERVAL_SECONDS}")
+    print(f"UPSTREAM_IDLE_TIMEOUT_SECONDS={UPSTREAM_IDLE_TIMEOUT_SECONDS}")
     print(f"SYSTEMD_WATCHDOG_ENABLED={SYSTEMD_WATCHDOG_ENABLED}")
     print(f"AUDIT_ENABLED={AUDIT_ENABLED}")
     print(f"AUDIT_HOST={AUDIT_HOST}")

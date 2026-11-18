@@ -146,6 +146,10 @@ REAL_NODE_PORT = 4403
 
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 4405
+
+# Reconnect if the radio sends no stream data for five minutes.
+# Set to 0 only when automatic stale-session recovery is not wanted.
+UPSTREAM_IDLE_TIMEOUT_SECONDS = 300
 ```
 
 After changing settings, restart the service:
@@ -298,6 +302,17 @@ sudo ss -ltnp | grep 4405
 
 Losing the upstream node connection should show the upstream state as
 `reconnecting`, but it should not kill the listener on port `4405`.
+
+The MUX also watches for a half-open upstream connection: a socket that the
+operating system still calls connected even though the radio has stopped
+sending stream data. After `UPSTREAM_IDLE_TIMEOUT_SECONDS` without receiving
+any bytes, it closes only that upstream socket and reconnects. Downstream
+clients remain attached to the MUX. Status lines expose `upstream_rx_age` and
+`idle_reconnects`, and a recovery is logged as:
+
+```text
+upstream receive idle for 300.0s (limit=300s); forcing reconnect
+```
 
 ## Metadata Audit Stream
 
